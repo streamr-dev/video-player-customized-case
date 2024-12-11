@@ -1,0 +1,484 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <meta content="text/html; charset=utf-8" http-equiv="Content-Type">
+    <title>Streamr video PoC</title>
+    <link type="image/png" rel="icon" href="favicon-16x16.png" size="16">
+    <link type="image/png" rel="icon" href="favicon-32x32.png" size="32">
+    <link type="image/png" rel="icon" href="favicon-96x96.png" size="96">
+    <link rel="stylesheet" type="text/css" href="demo.css" />
+    <script src="https://cdn.jsdelivr.net/npm/lodash@4.17.21/lodash.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@3.3.2"></script>
+    <script src="https://cdn.jsdelivr.net/npm/luxon@1.27.0"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-luxon@1.0.0"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-streaming@2.0.0"></script>
+    <script src="mpegts.js"></script>
+    <script type="module">
+        class TraceWrapper {
+            constructor(trace) {
+                this.trace = trace;
+                this.isActive = false;
+            }
+
+            start() {
+                if (!this.isActive) {
+                    this.trace.start();
+                    this.isActive = true;
+                }
+            }
+
+            stop() {
+                if (this.isActive) {
+                    this.trace.stop();
+                    this.isActive = false;
+                } else {
+                    console.log('Trace is already stopped');
+                }
+            }
+        }
+        // Import the functions you need from the SDKs you need
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/10.7.2/firebase-app.js";
+        import { getAnalytics, logEvent } from "https://www.gstatic.com/firebasejs/10.7.2/firebase-analytics.js";
+        import { getPerformance, trace } from "https://www.gstatic.com/firebasejs/10.7.2/firebase-performance.js"
+        // TODO: Add SDKs for Firebase products that you want to use
+        // https://firebase.google.com/docs/web/setup#available-libraries
+      
+        // Your web app's Firebase configuration
+        // For Firebase JS SDK v7.20.0 and later, measurementId is optional
+        const firebaseConfig = {
+          apiKey: "AIzaSyBotNXcvFme2aFSnE7jK619TspYa5TWxPc",
+          authDomain: "testnet3-video.firebaseapp.com",
+          projectId: "testnet3-video",
+          storageBucket: "testnet3-video.appspot.com",
+          messagingSenderId: "667822760630",
+          appId: "1:667822760630:web:156484dec54ef23f533c17",
+          measurementId: "G-K6X2J2YWM4"
+        };
+      
+        // Initialize Firebase
+        const app = initializeApp(firebaseConfig);
+        const analytics = getAnalytics(app);
+        const perf = getPerformance(app)
+        const time_to_video = trace(perf, "time_to_video")
+        window.firebase = {}
+        window.firebase.logEvent = logEvent
+        window.firebase.analytics = analytics
+        window.time_to_video = new TraceWrapper(time_to_video)
+        window.time_to_video.start()
+        
+      </script>
+</head>
+
+<body>
+    <div>
+        <div id="metrics" style="display: none;">
+            <div id="fpsDisplay">FPS: 0</div>
+            <div id="delayDisplay">ms: 0</div>
+            <div id="msgDisplay">msg #: 0</div>
+            <div id="msgCounter">msgs received: 0</div>
+            <div id="unpackedVideoBytes">RX: 0</div>
+            <div id="unpackedVideoRate">RX/s: 0</div>
+        </div>
+        <div style="height: 200px;">
+            <canvas id="myChart"></canvas>
+        </div>
+        <div class="video-container">
+            
+            <video width="1280" height="720" name="videoElement" controls autoplay muted playsinline preload="metadata" poster="streamr-loader.gif">
+                Your browser is too old which doesn't support HTML5 video.
+            </video>
+            
+        </div>
+    </div>
+    
+    
+    <script>
+        
+        class ByteTracker {
+            constructor() {
+                this.receivedBytes = []; // Store {timestamp, bytes} objects
+                this.time = 5000 // how many milliseconds old data we are storing
+            }
+
+            addBytes(count) {
+                const now = Date.now();
+                this.receivedBytes.push({ timestamp: now, bytes: count });
+                this.cleanup();
+            }
+
+            cleanup() {
+                const secondAgo = Date.now() - this.time;
+                this.receivedBytes = this.receivedBytes.filter(record => record.timestamp > secondAgo);
+            }
+
+            getAverageBytesPerSecond() {
+                this.cleanup();
+                return this.receivedBytes.reduce((total, record) => total + record.bytes, 0) / 5;
+            }
+        }
+
+        class MovingAverageCalculator {
+            constructor(maxLength) {
+                this.maxLength = maxLength;
+                this.numbers = [];
+            }
+
+            addNumber(number) {
+                this.numbers.push(number);
+                if (this.numbers.length > this.maxLength) {
+                    this.numbers.shift(); // Remove the oldest number
+                }
+            }
+
+            calculateAverage() {
+                const sum = this.numbers.reduce((acc, val) => acc + val, 0);
+                return sum / this.numbers.length;
+            }
+        }
+        let byteCount = 0
+        let packetLatency = 0
+        let averagePacketLatency = new MovingAverageCalculator(50)
+        let byteTracker = new ByteTracker()
+        let msgNumber = 0
+        let msgcounter = 0
+        Chart.defaults.set('plugins.streaming', {
+            duration: 20000
+        });
+        const ctx = document.getElementById('myChart');
+        const chart = new Chart(ctx, {
+            type: 'line',
+            data: {
+                datasets: [
+                    {
+                        label: 'avg. DL speed KB/s',
+                        backgroundColor: "#4dc9f6",
+                        borderColor: "#4dc9f6",
+                        borderDash: [8, 4],
+                        data: []
+                    },
+                    {
+                        label: 'Latency ms',
+                        backgroundColor: "#ECAF33",
+                        borderColor: "#ECAF33",
+                        data: []
+                    },
+                    {
+                        label: 'FPS',
+                        backgroundColor: "#5473b3",
+                        borderColor: "#5473b3",
+                        data: []
+                    },
+                    {
+                        label: 'avg. latency ms',
+                        backgroundColor: "#ECAF33",
+                        borderColor: "#ECAF33",
+                        data: []
+                    }
+                    
+                ]},
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                plugins: {
+                    // Change options for ALL axes of THIS CHART
+                    streaming: {
+                        duration: 30000
+                    }
+                    },
+                    scales: {
+                    x: {
+                        type: 'realtime',
+                        // Change options only for THIS AXIS
+                        realtime: {
+                            duration: 30000
+                        }
+                    }
+                }
+            }
+        });
+        const elementToToggle = document.getElementById("metrics");
+        function toggleMetrics() {
+            if (elementToToggle.style.display === "none" || elementToToggle.style.display === "") {
+                elementToToggle.style.display = "block";
+            } else {
+                elementToToggle.style.display = "none";
+            }
+        }
+        document.addEventListener("keydown", (event) => {
+            if (event.key === "r" || event.key === "R") {
+                toggleMetrics();
+            }
+        });
+        var checkBoxFields = ['isLive', 'withCredentials', 'liveBufferLatencyChasing'];
+        var streamURL, mediaSourceURL;
+
+        function player_load() {
+            console.log('isSupported: ' + mpegts.isSupported());
+            var i;
+            var mediaDataSource = {
+                type: 'mse'
+            };
+            mediaDataSource['url'] = '0x5f8e71b79df31565e23a603a981fc78ddbab9d71/brubeck-video-stream' 
+            //console.log('MediaDataSource', mediaDataSource);
+            player_load_mds(mediaDataSource);
+        }
+
+        function player_load_mds(mediaDataSource) {
+            var element = document.getElementsByName('videoElement')[0];
+
+            if (typeof player !== "undefined") {
+                if (player != null) {
+                    // try to destroy streamrclient if its in window.streamr
+                    try {
+                        window.streamr.destroy()
+                    } catch(error) {
+                        console.log('Attempting to destroy streamr client', error)
+                    }
+                    player.unload();
+                    player.detachMediaElement();
+                    player.destroy();
+                    player = null;
+                }
+            }
+            player = mpegts.createPlayer(mediaDataSource, {
+                isLive: true,
+                enableWorker: false,
+                lazyLoad: false,
+                stashInitialSize: 2048,
+                autoCleanupSourceBuffer: true,
+                liveBufferLatencyChasing: true, 
+                liveBufferLatencyChasingOnPaused: true,
+                liveBufferLatencyMaxLatency: 5
+            });
+            player.attachMediaElement(element);
+            try {
+                player.load();
+            } catch(e){
+                console.log('something went wrong', e)
+            }    
+
+            player._player_engine._mse_controller.on('source_open', function(event, ...args) {
+                console.log(event)
+
+                player._player_engine._transmuxer._controller._ioctl._loader.on('subscribe_till_first_message', function(event, ...args){
+                    // console.log(`Event: ${event} with arguments:`, args)
+                    console.log('Client subscribe till first message', event)
+                })
+
+                player._player_engine._transmuxer._controller._ioctl._loader.on('navigation_till_first_message', function(event, ...args){
+                    // console.log(`Event: ${event} with arguments:`, args)
+                    console.log('Client navigation till first message', event)
+                })
+
+                player._player_engine._transmuxer._controller._ioctl._loader.on('packetLatency', function(event){
+                    //console.log(`Event: ${event} with arguments:`, args)
+                    packetLatency = event
+                    averagePacketLatency.addNumber(packetLatency)
+                    
+                })
+
+                player._player_engine._transmuxer._controller._ioctl._loader.on('unpackedVideoDataReceivedInBytes', function(event, ...args){
+                    // console.log(`Event: ${event} with arguments:`, args)
+                    byteCount = event
+                    byteTracker.addBytes(byteCount)
+                })
+
+                player._player_engine._transmuxer._controller._ioctl._loader.on('msgCounter', function(event, ...args){
+                    msgcounter = event
+                    // console.log(`Event: ${event} with arguments:`, args)
+                })
+
+                player._player_engine._transmuxer._controller._ioctl._loader.on('msgNumber', function(event, ...args){
+                    msgNumber = event
+                    // console.log(`Event: ${event} with arguments:`, args)
+                })
+                
+            })
+
+            player._player_engine._mse_controller.on('init_segment', function(event, ...args) {
+                //window.time_to_video.stop()
+                const now = performance.now()
+                console.log('Time from navigation start till initialization of media segment in ms', now)
+                console.log(event)
+
+                // create a custom dimension for GA4
+                // add data to custom dimension
+                // log only once, for video, otherwise audio init segment will log also
+                window.firebase.logEvent(window.firebase.analytics, 'time_to_video', {
+                    'codec': event,
+                    'time_to_video': now
+                })
+
+                /*window.streamr.subscriber.node.cachedNode.stack.layer0Node.on('connected', function(event, ...args) {
+                    //console.log(`Client connected: ${event} with arguments:`, args)
+                })
+
+                window.streamr?.subscriber?.node?.cachedNode?.stack?.layer0Node.on('disconnected', function(event, ...args) {
+                    //console.log(`Client disconnected: ${event} with arguments:`, args)
+                })
+
+                window.streamr?.subscriber?.node?.cachedNode?.stack?.streamrNode.on('newMessage', function(event, ...args) {
+                    //console.log(`Client new message: ${event} with arguments:`, args)
+                })*/
+
+            })
+
+            player.on('error', function(event) {
+                player_load()
+            })
+
+           
+        }
+
+        function player_start() {
+            player.play();
+        }
+
+        function player_pause() {
+            player.pause();
+        }
+
+        function player_destroy() {
+            player.pause();
+            player.unload();
+            player.detachMediaElement();
+            player.destroy();
+            player = null;
+        }
+
+        function player_seekto() {
+            var input = document.getElementsByName('seekpoint')[0];
+            player.currentTime = parseFloat(input.value);
+        }
+
+        function switch_url() {
+            streamURL.className = '';
+            mediaSourceURL.className = 'hidden';
+            saveSettings();
+        }
+
+        function switch_mds() {
+            streamURL.className = 'hidden';
+            mediaSourceURL.className = '';
+            saveSettings();
+        }
+
+        function ls_get(key, def) {
+            try {
+                var ret = localStorage.getItem('mpegts_demo.' + key);
+                if (ret === null) {
+                    ret = def;
+                }
+                return ret;
+            } catch (e) {}
+            return def;
+        }
+
+        function ls_set(key, value) {
+            try {
+                localStorage.setItem('mpegts_demo.' + key, value);
+            } catch (e) {}
+        }
+
+        function saveSettings() {
+            if (mediaSourceURL.className === '') {
+                ls_set('inputMode', 'MediaDataSource');
+            } else {
+                ls_set('inputMode', 'StreamURL');
+            }
+            var i;
+            for (i = 0; i < checkBoxFields.length; i++) {
+                var field = checkBoxFields[i];
+                /** @type {HTMLInputElement} */
+                var checkbox = document.getElementById(field);
+                ls_set(field, checkbox.checked ? '1' : '0');
+            }
+            var msURL = document.getElementById('msURL');
+            var sURL = document.getElementById('sURL');
+            ls_set('msURL', msURL.value);
+            ls_set('sURL', sURL.value);
+        }
+
+
+        function showVersion() {
+            var version = mpegts.version;
+            document.title = document.title + " (v" + version + ")";
+        }
+
+        document.addEventListener('DOMContentLoaded', function () {
+            streamURL = document.getElementById('streamURL');
+            mediaSourceURL = document.getElementById('mediaSourceURL');
+            player_load();
+        });
+
+        const video = document.querySelector('video');
+        const fpsDisplay = document.getElementById("fpsDisplay");
+        const delayDisplay = document.getElementById("delayDisplay");
+        const msgDisplay = document.getElementById("msgDisplay");
+        const msgCounter = document.getElementById("msgCounter");
+        const bytesReceived = document.getElementById("unpackedVideoBytes");
+        const unpackedVideoRate = document.getElementById("unpackedVideoRate")
+
+        let frameCount = 0;
+        let startTime = null;
+        
+        video.addEventListener('timeupdate', () => {
+            if (!startTime) {
+                startTime = performance.now();
+            }
+        });
+        setInterval(() => {
+            if (startTime !== null) {
+                const currentTime = performance.now();
+                const elapsedTime = (currentTime - startTime) / 1000; // Convert to seconds
+                const newFrameCount = video.webkitDecodedFrameCount
+                const fps = (newFrameCount - frameCount) / elapsedTime;
+                const bytesReceived = byteCount
+                const dlSpeed = (bytesReceived - byteCount)/ elapsedTime
+                byteCount = bytesReceived
+                //let byteCount = window.firebase.measurements.raw.unpackedVideoData
+                
+                fpsDisplay.innerText = `Current FPS: ${fps.toFixed(2)}`
+                unpackedVideoRate.innerText = `RX/s: ${(byteTracker.getAverageBytesPerSecond()/1024).toFixed(2)} KB/s `
+
+                chart.data.datasets[0].data.push({
+                    x: Date.now(),
+                    y: byteTracker.getAverageBytesPerSecond()/1024
+                });
+
+                chart.data.datasets[2].data.push({
+                    x: Date.now(),
+                    y: fps
+                });
+
+                
+                
+                // Reset the frame count and start time for the next interval
+                frameCount = newFrameCount
+                startTime = currentTime;
+            }
+        }, 1000);
+
+        setInterval(() => {
+            delayDisplay.innerText = `latency: ${packetLatency} ms` 
+            msgDisplay.innerText = `msg #: ${msgNumber}` 
+            msgCounter.innerText = `msgs received: ${msgcounter}` 
+            //bytesReceived.innerText = `RX: ${(window.firebase.measurements.raw.unpackedVideoData/1024).toFixed(2)} KB` 
+
+            chart.data.datasets[1].data.push({
+                    x: Date.now(),
+                    y: packetLatency
+                });
+
+            chart.data.datasets[3].data.push({
+                x: Date.now(),
+                y: averagePacketLatency.calculateAverage()
+            })
+        }, 250);
+
+    </script>
+   
+</body>
+
+</html>
